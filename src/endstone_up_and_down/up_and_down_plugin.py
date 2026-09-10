@@ -115,6 +115,21 @@ class UpAndDownPlugin(Plugin):
 
         self.economy_plugin = self.server.plugin_manager.get_plugin('arc_core')
         self.qqsync = self._get_qq_sync_plugin()
+        self._register_arc_main_menu_button()
+
+    def _register_arc_main_menu_button(self) -> None:
+        core = getattr(self, "economy_plugin", None)
+        if core is None or not hasattr(core, "api_register_main_menu_button"):
+            return
+        try:
+            core.api_register_main_menu_button(
+                "up_and_down:main",
+                "证券交易所",
+                on_click=lambda p: p.perform_command("stock ui"),
+                priority=6,
+            )
+        except Exception:
+            pass
 
     def _get_qq_sync_plugin(self):
         """Resolve ARC QQ Sync plugin (AstrBot hub id first, legacy id fallback).
@@ -134,7 +149,12 @@ class UpAndDownPlugin(Plugin):
 
 
     def on_disable(self) -> None:
-        pass
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+            if core is not None and hasattr(core, "api_unregister_main_menu_button"):
+                core.api_unregister_main_menu_button("up_and_down:main")
+        except Exception:
+            pass
 
     def _extract_player_name(self, name: str) -> str:
         """
