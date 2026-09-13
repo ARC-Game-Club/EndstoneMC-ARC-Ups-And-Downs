@@ -127,6 +127,7 @@ class UpAndDownPlugin(Plugin):
                 "证券交易所",
                 on_click=lambda p: p.perform_command("stock ui"),
                 priority=6,
+                icon="textures/arc_core/stock.png",
             )
         except Exception:
             pass
