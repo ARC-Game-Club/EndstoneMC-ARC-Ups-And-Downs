@@ -8,7 +8,7 @@
 
 - **Python**: 3.13+
 - **Minecraft 服务器**: 支持 EndStone 框架
-- **依赖插件**: arc_core (经济系统)；群日报可选依赖 [endstone-arc-qq-sync-astrbot](https://github.com/ARC-Minecraft/EndstoneMC-ARC-QQ-Sync-Plugin)
+- **依赖插件**: arc_core (经济系统)；群日报可选依赖 [endstone-arc-qq-sync-astrbot](https://github.com/ARC-Game-Club/EndstoneMC-ARC-QQ-Sync-Plugin)
 
 ## 📦 依赖安装
 
