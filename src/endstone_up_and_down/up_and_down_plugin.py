@@ -635,7 +635,7 @@ class UpAndDownPlugin(Plugin):
             args[1] stock_name, args[2] margin, args[3] [leverage]
             Return: (bool, message)
         '''
-        direction_text = "做多" if direction == "long" else "做空"
+        direction_text = "多" if direction == "long" else "空"
         stock_name = args[1]
 
         try:
