@@ -170,3 +170,7 @@ wheelhouse/
 # IDE
 .cursor/
 .joycode/
+# IDE
+.cursor/
+.joycode/
+.zcode/

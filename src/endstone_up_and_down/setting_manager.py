@@ -57,6 +57,41 @@ update_interval=60
 # 交易手续费率（百分比，例如：2.0 表示2%）
 # Trading fee rate (percentage, e.g.: 2.0 means 2%)
 trading_fee_rate=1.0
+
+# ===== 合约交易（做空/杠杆）设置 =====
+# Contract trading (short/leverage) settings
+
+# 杠杆上限（整数）
+# Max leverage (int)
+contract_max_leverage=10
+
+# 可选杠杆档位（逗号分隔，不超过上限）
+# Leverage options (comma separated, not exceeding max)
+contract_leverage_options=2,3,5,10
+
+# 维持保证金率（百分比）：权益 <= 保证金*该比例 时触发强平，10 表示亏损达保证金的90%强平
+# Maintenance margin rate (percent): liquidate when equity <= margin * rate
+contract_maintenance_rate=10
+
+# 资金利息（百分比/小时）：按借入部分（仓位价值-保证金）每小时计息
+# Interest rate (percent per hour) on the borrowed part (position value - margin)
+contract_interest_hourly=0.01
+
+# 强平手续费（占仓位价值百分比）
+# Liquidation fee (percent of position value)
+contract_liquidation_fee=1.0
+
+# 最低保证金（元）
+# Minimum margin per position
+contract_min_margin=100
+
+# 强平检测间隔（秒）
+# Liquidation check interval (seconds)
+contract_check_interval=20
+
+# 低保证金预警线（权益占保证金百分比，低于时提醒一次）
+# Warning threshold (equity/margin percent, notify once below)
+contract_warning_rate=30
 """
         with self.setting_file_path.open("w", encoding="utf-8") as f:
             f.write(default_config)
@@ -128,4 +163,70 @@ trading_fee_rate=1.0
             return float(self.get_setting("trading_fee_rate", "1.0"))
         except ValueError:
             return 1.0
+
+    def get_contract_max_leverage(self):
+        """获取合约杠杆上限"""
+        try:
+            return int(self.get_setting("contract_max_leverage", "10"))
+        except ValueError:
+            return 10
+
+    def get_contract_leverage_options(self):
+        """获取可选杠杆档位列表（去重、升序、过滤超上限）"""
+        raw = self.get_setting("contract_leverage_options", "2,3,5,10") or "2,3,5,10"
+        options = []
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError:
+                continue
+            if 1 < value <= self.get_contract_max_leverage() and value not in options:
+                options.append(value)
+        options.sort()
+        return options or [2, 3, 5, 10]
+
+    def get_contract_maintenance_rate(self):
+        """获取维持保证金率（百分比）：权益 <= 保证金*该比例 时强平"""
+        try:
+            return float(self.get_setting("contract_maintenance_rate", "10"))
+        except ValueError:
+            return 10.0
+
+    def get_contract_interest_hourly(self):
+        """获取合约资金利息（百分比/小时，按借入部分计息）"""
+        try:
+            return float(self.get_setting("contract_interest_hourly", "0.01"))
+        except ValueError:
+            return 0.01
+
+    def get_contract_liquidation_fee_rate(self):
+        """获取强平手续费率（占仓位价值百分比）"""
+        try:
+            return float(self.get_setting("contract_liquidation_fee", "1.0"))
+        except ValueError:
+            return 1.0
+
+    def get_contract_min_margin(self):
+        """获取单笔合约最低保证金"""
+        try:
+            return float(self.get_setting("contract_min_margin", "100"))
+        except ValueError:
+            return 100.0
+
+    def get_contract_check_interval(self):
+        """获取强平检测间隔（秒）"""
+        try:
+            return max(5, int(self.get_setting("contract_check_interval", "20")))
+        except ValueError:
+            return 20
+
+    def get_contract_warning_rate(self):
+        """获取低保证金预警线（权益占保证金百分比）"""
+        try:
+            return float(self.get_setting("contract_warning_rate", "30"))
+        except ValueError:
+            return 30.0
 

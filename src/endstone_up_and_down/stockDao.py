@@ -59,6 +59,29 @@ class StockDao:
             "id": "INTEGER primary key autoincrement",
             "send_date": "TEXT"
         })
+
+        '''Contract (margin) position table 逐仓合约仓位表'''
+        self.database_manager.create_table("tb_margin_position", {
+            "id": "INTEGER primary key autoincrement",
+            "player_xuid": "TEXT",
+            "stock_name": "nvarchar",
+            "direction": "nvarchar",      # long / short
+            "leverage": "int",
+            "margin": "float",            # 保证金
+            "share": "int",
+            "entry_price": "float",
+            "open_time": "float",
+            "open_fee": "float",
+            "status": "nvarchar",         # open / closed / liquidated
+            "close_price": "float",
+            "close_time": "float",
+            "close_fee": "float",
+            "interest": "float",
+            "liquidation_fee": "float",
+            "realized_pnl": "float",      # 平仓净盈亏（含开仓费分摊/平仓费/利息/强平费）
+            "close_reason": "nvarchar",   # manual / liquidation
+            "warned": "int"
+        })
         
         
     def create_order(self, xuid, stock_name, share, type):
@@ -79,6 +102,15 @@ class StockDao:
         order_id = result["id"] if result else None
         
         return order_id
+
+    def finish_order(self, order_id, price, tax, total):
+        """合约订单完结：回填成交价/费用/现金流"""
+        self.database_manager.update("tb_player_order", {
+            "single_price": float(price),
+            "finish_time": time.time(),
+            "tax": float(tax),
+            "total": float(total)
+        }, f"id = {order_id}")
 
     def buy(self, order_id, stock_name, xuid, share, price, tax, total):
         stock_name = stock_name.upper()
@@ -150,8 +182,164 @@ class StockDao:
     def check_user_account(self, xuid):
         user_count = self.database_manager.query_one('SELECT COUNT(*) as count FROM tb_player_account WHERE player_xuid = ? ', (xuid,))
         return user_count["count"] == 1
-        
-        
+
+    # ==================== 合约（逐仓杠杆/做空）仓位 ====================
+
+    def create_margin_position(self, xuid, stock_name, direction, leverage, margin, share, entry_price, open_fee):
+        """创建合约仓位，返回仓位ID"""
+        stock_name = stock_name.upper()
+        self.database_manager.insert("tb_margin_position", {
+            "player_xuid": xuid,
+            "stock_name": stock_name,
+            "direction": direction,
+            "leverage": leverage,
+            "margin": float(margin),
+            "share": int(share),
+            "entry_price": float(entry_price),
+            "open_time": time.time(),
+            "open_fee": float(open_fee),
+            "status": "open",
+            "warned": 0
+        })
+        result = self.database_manager.query_one(
+            "SELECT id FROM tb_margin_position WHERE player_xuid = ? ORDER BY id DESC LIMIT 1",
+            (xuid,)
+        )
+        return result["id"] if result else None
+
+    def get_margin_position(self, position_id):
+        return self.database_manager.query_one(
+            "SELECT * FROM tb_margin_position WHERE id = ?", (position_id,)
+        )
+
+    def get_open_margin_positions(self, xuid=None):
+        """查询未平仓仓位；xuid 为 None 时返回全服（供强平引擎使用）"""
+        if xuid is None:
+            return self.database_manager.query_all(
+                "SELECT * FROM tb_margin_position WHERE status = 'open' ORDER BY id ASC"
+            )
+        return self.database_manager.query_all(
+            "SELECT * FROM tb_margin_position WHERE status = 'open' AND player_xuid = ? ORDER BY id DESC",
+            (xuid,)
+        )
+
+    def get_margin_positions(self, player_xuid, status=None, page=1, page_size=10, exclude_open=False):
+        """
+        分页查询玩家合约仓位
+        :param status: 指定状态精确过滤（open/closed/liquidated）
+        :param exclude_open: True 时查所有已平仓（closed+liquidated）
+        """
+        offset = (page - 1) * page_size
+        sql = "SELECT * FROM tb_margin_position WHERE player_xuid = ?"
+        params = [player_xuid]
+        if exclude_open:
+            sql += " AND status != 'open'"
+        elif status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([page_size, offset])
+        return self.database_manager.query_all(sql, tuple(params))
+
+    def get_open_margin_summary(self, xuid):
+        """主面板用：未平仓笔数与占用保证金合计（不拉价格）"""
+        row = self.database_manager.query_one(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(margin), 0) AS total FROM tb_margin_position WHERE player_xuid = ? AND status = 'open'",
+            (xuid,)
+        )
+        if not row:
+            return 0, 0.0
+        return int(row["cnt"] or 0), float(row["total"] or 0.0)
+
+    def get_closed_margin_pnl_total(self, xuid):
+        """已平仓（含强平）净盈亏合计"""
+        row = self.database_manager.query_one(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM tb_margin_position WHERE player_xuid = ? AND status != 'open'",
+            (xuid,)
+        )
+        return float(row["total"]) if row and row["total"] is not None else 0.0
+
+    def get_margin_deployed_total(self, xuid):
+        """历史累计投入合约的资金（保证金+开仓费），供相对盈亏做分母"""
+        row = self.database_manager.query_one(
+            "SELECT COALESCE(SUM(margin + open_fee), 0) AS total FROM tb_margin_position WHERE player_xuid = ?",
+            (xuid,)
+        )
+        return float(row["total"]) if row and row["total"] is not None else 0.0
+
+    def set_margin_warned(self, position_id, warned):
+        self.database_manager.update(
+            "tb_margin_position", {"warned": 1 if warned else 0}, f"id = {position_id}"
+        )
+
+    def add_margin(self, position_id, new_margin):
+        """追加保证金：直接写入追加后的保证金总额（调用方持玩家锁，无竞态）"""
+        self.database_manager.update(
+            "tb_margin_position",
+            {"margin": float(new_margin), "warned": 0},
+            f"id = {position_id}"
+        )
+
+    def settle_margin_position(self, position_id, close_share, close_price, close_fee,
+                               interest, liquidation_fee, realized_pnl, close_reason):
+        """
+        平仓结算：close_share 达到持仓股数时整行置为已平仓；
+        部分平仓时原行按比例缩减 share/margin/open_fee，平掉部分另插一行已平仓记录。
+        :return: (position_row_after, closed_row) 或 (None, None) 表示仓位不存在或已平
+        """
+        pos = self.get_margin_position(position_id)
+        if pos is None or pos["status"] != "open":
+            return None, None
+
+        share = int(pos["share"])
+        close_share = max(1, min(int(close_share), share))
+        proportion = Decimal(str(close_share)) / Decimal(str(share))
+
+        closed_margin = float(Decimal(str(pos["margin"])) * proportion)
+        closed_open_fee = float(Decimal(str(pos["open_fee"])) * proportion)
+        status = "liquidated" if close_reason == "liquidation" else "closed"
+
+        closed_fields = {
+            "stock_name": pos["stock_name"],
+            "player_xuid": pos["player_xuid"],
+            "direction": pos["direction"],
+            "leverage": pos["leverage"],
+            "margin": closed_margin,
+            "share": close_share,
+            "entry_price": pos["entry_price"],
+            "open_time": pos["open_time"],
+            "open_fee": closed_open_fee,
+            "status": status,
+            "close_price": float(close_price),
+            "close_time": time.time(),
+            "close_fee": float(close_fee),
+            "interest": float(interest),
+            "liquidation_fee": float(liquidation_fee),
+            "realized_pnl": float(realized_pnl),
+            "close_reason": close_reason,
+            "warned": pos["warned"] or 0,
+        }
+
+        if close_share >= share:
+            self.database_manager.update("tb_margin_position", closed_fields, f"id = {position_id}")
+            closed_fields["id"] = position_id
+            return None, closed_fields
+
+        # 部分平仓：缩减原行，另插已平行
+        remain_margin = float(Decimal(str(pos["margin"])) - Decimal(str(closed_margin)))
+        remain_open_fee = float(Decimal(str(pos["open_fee"])) - Decimal(str(closed_open_fee)))
+        self.database_manager.update("tb_margin_position", {
+            "share": share - close_share,
+            "margin": remain_margin,
+            "open_fee": remain_open_fee,
+        }, f"id = {position_id}")
+
+        closed_fields.pop("id", None)
+        self.database_manager.insert("tb_margin_position", closed_fields)
+
+        remain = self.get_margin_position(position_id)
+        return remain, closed_fields
+
     def get_balance(self, xuid):
         account = self.database_manager.query_one("SELECT * FROM tb_player_account WHERE player_xuid = ? ", (xuid,))
 
@@ -313,10 +501,11 @@ class StockDao:
         return cached_data
     
     
-    def get_all_players_profit_loss(self, get_stock_price_func):
+    def get_all_players_profit_loss(self, get_stock_price_func, contract_interest_hourly=0.0):
         """
-        获取所有玩家的盈亏数据
+        获取所有玩家的盈亏数据（含现货与逐仓合约）
         :param get_stock_price_func: 获取股票价格的函数
+        :param contract_interest_hourly: 合约资金利息（百分比/小时，按借入部分计息）
         :return: 包含玩家盈亏信息的列表
         """
         # 获取所有有账户的玩家
@@ -374,21 +563,22 @@ class StockDao:
                 tax = Decimal(str(order['tax'])) if order['tax'] else Decimal('0')
                 total_sell += (share * price) + tax
             
-            # 如果累计投入为0，跳过（没有实际投资过）
-            if total_buy == 0:
+            # 如果现货与合约都没有实际投入，跳过（没有实际投资过）
+            margin_deployed = Decimal(str(self.get_margin_deployed_total(player_xuid)))
+            if total_buy == 0 and margin_deployed == 0:
                 continue
-            
+
             # 计算持仓市值
             holdings_value = Decimal('0')
             holdings = self.database_manager.query_all(
                 "SELECT stock_name, share FROM tb_player_stock WHERE player_xuid = ? AND share > 0",
                 (player_xuid,)
             )
-            
+
             for holding in holdings:
                 stock_name = holding['stock_name']
                 share = Decimal(str(holding['share']))
-                
+
                 # 获取当前股票价格
                 if stock_name not in price_cache_dict:
                     try:
@@ -400,22 +590,62 @@ class StockDao:
                     current_price = price_cache_dict[stock_name]
                 if current_price:
                     holdings_value += current_price * share
-            
-            # 当前盈利 = 持仓市值 - 所有购买股票的成本 + 所有出售股票的收入
-            absolute_profit_loss = holdings_value - total_buy + total_sell
-            
-            # 相对盈亏（百分比） = 绝对盈亏 / 累计投入 * 100
-            if total_buy > 0:
-                relative_profit_loss = float((absolute_profit_loss / total_buy) * 100)
+
+            # ===== 合约（逐仓）仓位 =====
+            # 已平仓净盈亏直接累加；未平仓按现价算浮动盈亏并扣应计利息
+            contract_closed_pl = Decimal(str(self.get_closed_margin_pnl_total(player_xuid)))
+
+            margin_locked = Decimal('0')          # 占用保证金（计入总财富）
+            contract_unrealized = Decimal('0')    # 浮动盈亏-应计利息（计入总财富与盈亏）
+            contract_open_fee_total = Decimal('0')  # 未平仓开仓费（已从余额扣，计入盈亏）
+
+            open_positions = self.database_manager.query_all(
+                "SELECT * FROM tb_margin_position WHERE player_xuid = ? AND status = 'open'",
+                (player_xuid,)
+            )
+            for pos in open_positions:
+                stock_name = pos['stock_name']
+                if stock_name not in price_cache_dict:
+                    try:
+                        current_price, _ = get_stock_price_func(stock_name)
+                    except Exception:
+                        current_price = None
+                    price_cache_dict[stock_name] = current_price
+                else:
+                    current_price = price_cache_dict[stock_name]
+                if not current_price:
+                    continue
+
+                price = Decimal(str(current_price))
+                entry = Decimal(str(pos['entry_price']))
+                pos_share = Decimal(str(pos['share']))
+                pos_margin = Decimal(str(pos['margin']))
+                pnl = (price - entry) * pos_share if pos['direction'] == 'long' else (entry - price) * pos_share
+                borrowed = max(entry * pos_share - pos_margin, Decimal('0'))
+                hours = Decimal(str(max(time.time() - float(pos['open_time']), 0.0) / 3600.0))
+                interest = borrowed * Decimal(str(contract_interest_hourly)) / Decimal('100') * hours
+
+                margin_locked += pos_margin
+                contract_unrealized += pnl - interest
+                contract_open_fee_total += Decimal(str(pos['open_fee']))
+
+            # 当前盈利 = 持仓市值 - 现货购买成本 + 现货出售收入 + 合约已平净盈亏 + 合约浮动盈亏 - 未平仓开仓费
+            absolute_profit_loss = holdings_value - total_buy + total_sell \
+                + contract_closed_pl + contract_unrealized - contract_open_fee_total
+
+            # 相对盈亏（百分比） = 绝对盈亏 / 累计投入（现货买入 + 合约保证金与开仓费） * 100
+            total_invested = total_buy + margin_deployed
+            if total_invested > 0:
+                relative_profit_loss = float((absolute_profit_loss / total_invested) * 100)
             else:
                 relative_profit_loss = 0.0
-            
+
             players_data.append({
                 'player_xuid': player_xuid,
-                'total_wealth': float(holdings_value) + float(balance),
+                'total_wealth': float(holdings_value) + float(balance) + float(margin_locked) + float(contract_unrealized),
                 'holdings_value': float(holdings_value),
                 'balance': float(balance),
-                'total_buy': float(total_buy),
+                'total_buy': float(total_invested),
                 'total_sell': float(total_sell),
                 'absolute_profit_loss': float(absolute_profit_loss),
                 'relative_profit_loss': relative_profit_loss

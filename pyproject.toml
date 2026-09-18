@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone_up_and_down"
-version = "0.5.6"
+version = "0.6.0"
 dependencies = [
     "yfinance"
 ]

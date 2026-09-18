@@ -67,8 +67,11 @@ class UIManager:
                 try:
                     # 获取账户信息
                     balance = self.plugin.stock_dao.get_balance(xuid)
-                    
+
                     cached_player_data = self.plugin.stock_dao.get_cached_single_player_profit_loss(xuid)
+
+                    # 合约占用（不拉价格，快速查询）
+                    contract_count, contract_margin = self.plugin.stock_dao.get_open_margin_summary(xuid)
 
                     content = f"=== 股票账户概览(每30分钟更新) ===\n\n"
                     if cached_player_data != None:
@@ -79,10 +82,12 @@ class UIManager:
 
                         # 获取玩家的颜色配置
                         profit_color = self.plugin.player_settings_manager.get_color_for_change(xuid, float(absolute_profit_loss))
-                        
+
                         # 构建内容
                         content += f"账户余额: ${balance:.2f}\n"
                         content += f"持仓市值: ${total_market_value:.2f}\n"
+                        if contract_count > 0:
+                            content += f"合约占用: ${contract_margin:.2f} ({contract_count}笔)\n"
                         content += f"总财富: ${total_wealth:.2f}\n"
 
                         # 显示绝对盈亏
@@ -116,7 +121,12 @@ class UIManager:
                             "我的持仓",
                             on_click=lambda sender: self.show_holdings_panel(sender)
                         )
-                        
+
+                        main_panel.add_button(
+                            "合约交易(做空/杠杆)",
+                            on_click=lambda sender: self.show_contract_center(sender)
+                        )
+
                         main_panel.add_button(
                             "我的收藏",
                             on_click=lambda sender: self.show_favorites_panel(sender)
@@ -543,7 +553,18 @@ class UIManager:
                             "买入",
                             on_click=lambda sender: self.show_buy_panel(sender, stock_name, current_price)
                         )
-                        
+
+                        # 合约开仓按钮（做多/做空）
+                        detail_panel.add_button(
+                            "杠杆做多",
+                            on_click=lambda sender: self.show_contract_open_panel(sender, stock_name, direction_index=0)
+                        )
+
+                        detail_panel.add_button(
+                            "做空",
+                            on_click=lambda sender: self.show_contract_open_panel(sender, stock_name, direction_index=1)
+                        )
+
                         # 如果有持仓，添加卖出按钮
                         if holding > 0:
                             detail_panel.add_button(
@@ -1019,7 +1040,983 @@ class UIManager:
             on_close=lambda sender: self.show_stock_detail_panel(sender, stock_name)
         )
         player.send_form(result_form)
-    
+
+    # ==================== 合约交易（做空/杠杆，逐仓） ====================
+    def _contract_rate_color(self, rate_percent, warning_rate):
+        """剩余保证金率着色：低于预警线红色，低于50%黄色，否则绿色"""
+        if rate_percent <= warning_rate:
+            return "§c"
+        if rate_percent <= 50:
+            return "§e"
+        return "§a"
+
+    def show_contract_center(self, player):
+        """合约交易中心"""
+        try:
+            xuid = player.xuid
+            import threading
+
+            def load_data():
+                try:
+                    interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+                    positions = self.plugin.stock_dao.get_open_margin_positions(xuid)
+
+                    balance = self.plugin.stock_dao.get_balance(xuid)
+                    summary = f"账户余额: ${balance:.2f}\n未平仓: {len(positions)} 笔"
+
+                    locked = Decimal(0)
+                    unrealized = Decimal(0)
+                    priced = True
+                    price_cache = {}
+                    for pos in positions:
+                        locked += Decimal(str(pos["margin"]))
+                        stock = pos["stock_name"]
+                        if stock not in price_cache:
+                            try:
+                                price_cache[stock] = self.plugin.get_stock_last_price(stock)[0]
+                            except Exception:
+                                price_cache[stock] = None
+                        price = price_cache[stock]
+                        if not price:
+                            priced = False
+                            continue
+                        pnl, interest = self.plugin._calc_contract_pnl_interest(pos, price, interest_hourly)
+                        unrealized += pnl - interest
+
+                    if positions:
+                        summary += f"\n占用保证金: ${float(locked):.2f}"
+                        if priced:
+                            profit_color = self.plugin.player_settings_manager.get_color_for_change(xuid, float(unrealized))
+                            summary += f"\n合约浮动盈亏: {profit_color}{float(unrealized):+.2f}§r (已扣应计利息)"
+                    else:
+                        fee_rate = self.plugin.setting_manager.get_trading_fee_rate()
+                        summary += f"\n\n§7逐仓模式：爆仓最多亏掉该笔保证金\n§7手续费 {fee_rate}%/开平仓，利息 {interest_hourly}%/小时(借入部分)"
+
+                    def show_panel(p):
+                        panel = ActionForm(
+                            title="合约交易",
+                            content=f"=== 合约交易中心（逐仓） ===\n\n{summary}\n\n§c警示: 杠杆放大收益也放大亏损，强平以系统实时检测为准"
+                        )
+                        panel.add_button(
+                            "我的仓位",
+                            on_click=lambda sender: self.show_contract_positions_panel(sender)
+                        )
+                        panel.add_button(
+                            "开仓（做多/做空）",
+                            on_click=lambda sender: self.show_contract_open_panel(sender)
+                        )
+                        panel.add_button(
+                            "仓位历史",
+                            on_click=lambda sender: self.show_contract_history_panel(sender)
+                        )
+                        panel.add_button(
+                            "合约教学",
+                            on_click=lambda sender: self.show_contract_teaching_panel(sender)
+                        )
+                        panel.add_button(
+                            "返回主菜单",
+                            on_click=lambda sender: self.show_main_panel(sender)
+                        )
+                        p.send_form(panel)
+
+                    self._run_for_player(player, show_panel)
+
+                except Exception as e:
+                    print(f"加载合约中心数据错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c加载合约中心时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示合约中心错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示合约中心时发生错误")
+
+    def show_contract_open_panel(self, player, stock_name: str = None, direction_index: int = 0):
+        """合约开仓表单"""
+        try:
+            xuid = player.xuid
+            balance = self.plugin.stock_dao.get_balance(xuid)
+            leverage_options = self.plugin.setting_manager.get_contract_leverage_options()
+            min_margin = self.plugin.setting_manager.get_contract_min_margin()
+            fee_rate = self.plugin.setting_manager.get_trading_fee_rate()
+            interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+
+            open_form = ModalForm(
+                title="合约开仓",
+                controls=[
+                    Label(
+                        text=f"§c逐仓合约：爆仓最多亏掉该笔保证金\n\n"
+                             f"账户余额: ${balance:.2f}\n"
+                             f"手续费: {fee_rate}% (开仓/平仓各收一次)\n"
+                             f"资金利息: {interest_hourly}%/小时 (按借入部分计)\n"
+                             f"最低保证金: ${min_margin:.0f}\n\n"
+                             f"§e做多=看涨赚钱，做空=看跌赚钱。杠杆越高，强平越快。"),
+                    TextInput(
+                        label="股票代码",
+                        placeholder="例如 AAPL / TSLA / BTC-USD ...",
+                        default_value=stock_name or ""
+                    ),
+                    Dropdown(
+                        label="方向",
+                        options=["▲ 做多（看涨）", "▼ 做空（看跌）"],
+                        default_index=1 if direction_index == 1 else 0
+                    ),
+                    TextInput(
+                        label="保证金（元）",
+                        placeholder=f"最低 {min_margin:.0f} ...",
+                        default_value=str(int(min_margin))
+                    ),
+                    Dropdown(
+                        label="杠杆倍数",
+                        options=[f"{l}x" for l in leverage_options],
+                        default_index=0
+                    )
+                ],
+                on_submit=lambda sender, json_str: self._handle_contract_open_submit(sender, json_str),
+                on_close=lambda sender: self.show_contract_center(sender)
+            )
+            player.send_form(open_form)
+
+        except Exception as e:
+            print(f"显示合约开仓面板错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示合约开仓面板时发生错误")
+
+    def _handle_contract_open_submit(self, player, json_str: str):
+        """解析开仓输入，拉现价后弹出确认面板"""
+        try:
+            data = json.loads(json_str)
+            stock_input = str(data[1] or "").strip().upper()
+            direction_index = data[2]
+            margin_str = str(data[3] or "").strip()
+            leverage_index = data[4]
+
+            if not stock_input:
+                player.send_message("§c请输入股票代码")
+                self.show_contract_open_panel(player, direction_index=direction_index)
+                return
+
+            try:
+                margin_amount = Decimal(margin_str)
+                if margin_amount <= 0:
+                    raise ValueError()
+            except Exception:
+                player.send_message("§c请输入有效的保证金金额")
+                self.show_contract_open_panel(player, stock_input, direction_index)
+                return
+
+            leverage_options = self.plugin.setting_manager.get_contract_leverage_options()
+            leverage = leverage_options[leverage_index] if leverage_index < len(leverage_options) else leverage_options[0]
+            direction = "short" if direction_index == 1 else "long"
+
+            import threading
+
+            def load_price():
+                try:
+                    market_price, tradeable = self.plugin.get_stock_last_price(stock_input)
+                    if tradeable is None or market_price is None:
+                        self._run_for_player(player, lambda p: p.send_message(
+                            f"§c无法获取 {stock_input} 的价格（代码错误或市场不支持）"))
+                        return
+
+                    price = Decimal(str(market_price))
+                    share = int(margin_amount * Decimal(leverage) / price)
+                    min_margin = Decimal(str(self.plugin.setting_manager.get_contract_min_margin()))
+
+                    if share < 1 or margin_amount < min_margin:
+                        need = price / Decimal(leverage)
+                        self._run_for_player(player, lambda p: p.send_message(
+                            f"§c保证金不足：{stock_input} 现价 ${float(price):.2f}，{leverage}x 杠杆至少需要 ${float(need):.2f} 保证金"))
+                        return
+
+                    open_value = price * Decimal(share)
+                    fee_rate = Decimal(str(self.plugin.setting_manager.get_trading_fee_rate() / 100))
+                    open_fee = open_value * fee_rate
+                    total_cost = margin_amount + open_fee
+
+                    pos_view = {
+                        "direction": direction,
+                        "entry_price": price,
+                        "share": share,
+                        "margin": margin_amount,
+                        "open_time": time.time(),
+                    }
+                    liq_price = self.plugin._calc_contract_liquidation_price(
+                        pos_view, self.plugin.setting_manager.get_contract_maintenance_rate()
+                    )
+
+                    direction_text = "▲ 做多" if direction == "long" else "▼ 做空"
+                    content = (
+                        f"=== 合约开仓确认 ===\n\n"
+                        f"标的: {stock_input}   现价: ${float(price):.2f}\n"
+                        f"方向: {direction_text}   杠杆: {leverage}x\n"
+                        f"股数: {share} 股（按保证金可开上限）\n"
+                        f"仓位价值: ${float(open_value):.2f}\n\n"
+                        f"占用保证金: ${float(margin_amount):.2f}\n"
+                        f"开仓手续费: ${float(open_fee):.2f}\n"
+                        f"合计扣款: ${float(total_cost):.2f}\n\n"
+                        f"§c预估强平价: ${float(liq_price):.2f}\n"
+                        f"§7权益随持仓时间被利息消耗，实际强平价会略有偏移；\n"
+                        f"§7强平以系统实时检测为准，存在至多数十秒延迟。"
+                    )
+
+                    def show_confirm(p):
+                        confirm_form = ActionForm(title="合约开仓确认", content=content)
+                        confirm_form.add_button(
+                            "确认开仓",
+                            on_click=lambda sender: self._handle_contract_open_confirm(
+                                sender, stock_input, direction, margin_amount, leverage
+                            )
+                        )
+                        confirm_form.add_button(
+                            "返回修改",
+                            on_click=lambda sender: self.show_contract_open_panel(
+                                sender, stock_input, direction_index
+                            )
+                        )
+                        p.send_form(confirm_form)
+
+                    self._run_for_player(player, show_confirm)
+
+                except Exception as e:
+                    print(f"合约开仓预览错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c合约开仓预览时发生错误"))
+
+            threading.Thread(target=load_price).start()
+
+        except Exception as e:
+            print(f"处理合约开仓输入错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c处理合约开仓输入时发生错误")
+
+    def _handle_contract_open_confirm(self, player, stock_name, direction, margin_amount, leverage):
+        xuid = player.xuid
+        callback_args = {"stock_name": stock_name}
+        params = [
+            "long" if direction == "long" else "short",
+            stock_name, str(margin_amount), str(leverage)
+        ]
+        self.plugin.execute_command(player, params, True, self._handle_contract_open_callback, callback_args)
+
+    def _handle_contract_open_callback(self, rtn, player, args):
+        success, message = rtn
+        stock_name = args["stock_name"]
+        result_form = ActionForm(
+            title="开仓成功" if success else "开仓失败",
+            content=message,
+            on_close=lambda sender: self.show_contract_center(sender)
+        )
+        result_form.add_button(
+            "查看我的仓位",
+            on_click=lambda sender: self.show_contract_positions_panel(sender)
+        )
+        result_form.add_button(
+            "返回合约中心",
+            on_click=lambda sender: self.show_contract_center(sender)
+        )
+        player.send_form(result_form)
+
+    def show_contract_positions_panel(self, player, page: int = 0):
+        """未平仓仓位列表（带风险色标）"""
+        try:
+            xuid = player.xuid
+            import threading
+
+            def load_data():
+                try:
+                    positions = self.plugin.stock_dao.get_margin_positions(
+                        xuid, status='open', page=page, page_size=8
+                    )
+                    if not positions:
+                        def show_empty(p):
+                            empty_form = ActionForm(
+                                title="我的仓位",
+                                content="当前没有未平仓合约\n\n提示: 在股票详情页或合约中心开仓",
+                                on_close=lambda sender: self.show_contract_center(sender)
+                            )
+                            empty_form.add_button(
+                                "开仓",
+                                on_click=lambda sender: self.show_contract_open_panel(sender)
+                            )
+                            empty_form.add_button(
+                                "返回合约中心",
+                                on_click=lambda sender: self.show_contract_center(sender)
+                            )
+                            p.send_form(empty_form)
+
+                        self._run_for_player(player, show_empty)
+                        return
+
+                    interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+                    maintenance_rate = self.plugin.setting_manager.get_contract_maintenance_rate()
+                    warning_rate = self.plugin.setting_manager.get_contract_warning_rate()
+
+                    buttons_data = []
+                    price_cache = {}
+                    total_equity = Decimal(0)
+                    for pos in positions:
+                        stock = pos["stock_name"]
+                        if stock not in price_cache:
+                            try:
+                                price_cache[stock] = self.plugin.get_stock_last_price(stock)[0]
+                            except Exception:
+                                price_cache[stock] = None
+                        price = price_cache[stock]
+
+                        direction_mark = "▲多" if pos["direction"] == "long" else "▼空"
+                        if not price:
+                            button_text = f"#{pos['id']} {stock} {direction_mark} {pos['leverage']}x\n{pos['share']}股 @ ${float(pos['entry_price']):.2f}\n§7价格获取失败"
+                            buttons_data.append((button_text, pos["id"]))
+                            continue
+
+                        pnl, interest = self.plugin._calc_contract_pnl_interest(pos, price, interest_hourly)
+                        margin = Decimal(str(pos["margin"]))
+                        equity = margin + pnl - interest
+                        total_equity += equity
+                        rate = float(equity / margin * 100) if margin > 0 else 0.0
+                        rate_color = self._contract_rate_color(rate, warning_rate)
+                        profit_color = self.plugin.player_settings_manager.get_color_for_change(xuid, float(pnl))
+
+                        button_text = (
+                            f"#{pos['id']} {stock} {direction_mark} {pos['leverage']}x\n"
+                            f"{pos['share']}股 @ ${float(pos['entry_price']):.2f} → ${float(price):.2f}\n"
+                            f"盈亏 {profit_color}{float(pnl):+.2f}§r | 保证金率 {rate_color}{rate:.1f}%§r"
+                        )
+                        buttons_data.append((button_text, pos["id"]))
+
+                    summary = ""
+                    if page == 0:
+                        summary = f"权益合计: ${float(total_equity):.2f}\n\n"
+
+                    def show_panel(p):
+                        panel = ActionForm(
+                            title="我的仓位",
+                            content=f"{summary}点击仓位查看详情/平仓"
+                        )
+                        for button_text, position_id in buttons_data:
+                            panel.add_button(
+                                button_text,
+                                on_click=lambda sender, pid=position_id: self.show_contract_position_detail(sender, pid)
+                            )
+                        if len(positions) >= 8:
+                            panel.add_button(
+                                "下一页",
+                                on_click=lambda sender: self.show_contract_positions_panel(sender, page + 1)
+                            )
+                        if page > 0:
+                            panel.add_button(
+                                "上一页",
+                                on_click=lambda sender: self.show_contract_positions_panel(sender, page - 1)
+                            )
+                        panel.add_button(
+                            "返回合约中心",
+                            on_click=lambda sender: self.show_contract_center(sender)
+                        )
+                        p.send_form(panel)
+
+                    self._run_for_player(player, show_panel)
+
+                except Exception as e:
+                    print(f"加载合约仓位错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c加载合约仓位时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示合约仓位面板错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示合约仓位面板时发生错误")
+
+    def show_contract_position_detail(self, player, position_id: int):
+        """仓位详情：风险指标 + 平仓操作"""
+        try:
+            xuid = player.xuid
+            import threading
+
+            def load_data():
+                try:
+                    pos = self.plugin.stock_dao.get_margin_position(position_id)
+                    if pos is None or str(pos["player_xuid"]) != str(xuid):
+                        self._run_for_player(player, lambda p: p.send_message(f"§c仓位 #{position_id} 不存在"))
+                        return
+                    if pos["status"] != "open":
+                        self._run_for_player(player, lambda p: self.show_contract_history_panel(p))
+                        return
+
+                    market_price, _ = self.plugin.get_stock_last_price(pos["stock_name"])
+                    if not market_price:
+                        self._run_for_player(player, lambda p: p.send_message(
+                            f"§c无法获取 {pos['stock_name']} 的当前价格"))
+                        return
+
+                    price = Decimal(str(market_price))
+                    interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+                    maintenance_rate = self.plugin.setting_manager.get_contract_maintenance_rate()
+                    warning_rate = self.plugin.setting_manager.get_contract_warning_rate()
+
+                    pnl, interest = self.plugin._calc_contract_pnl_interest(pos, price, interest_hourly)
+                    margin = Decimal(str(pos["margin"]))
+                    equity = margin + pnl - interest
+                    rate = float(equity / margin * 100) if margin > 0 else 0.0
+                    rate_color = self._contract_rate_color(rate, warning_rate)
+                    profit_color = self.plugin.player_settings_manager.get_color_for_change(xuid, float(pnl))
+                    liq_price = self.plugin._calc_contract_liquidation_price(pos, maintenance_rate)
+
+                    direction_text = "▲ 做多" if pos["direction"] == "long" else "▼ 做空"
+                    hold_hours = max(time.time() - float(pos["open_time"]), 0.0) / 3600.0
+
+                    content = (
+                        f"=== 仓位 #{pos['id']} ===\n\n"
+                        f"标的: {pos['stock_name']}   {direction_text} {pos['leverage']}x\n"
+                        f"股数: {pos['share']} 股   持仓: {hold_hours:.1f} 小时\n\n"
+                        f"开仓价: ${float(pos['entry_price']):.2f}\n"
+                        f"现价: ${float(price):.2f}\n"
+                        f"浮动盈亏: {profit_color}{float(pnl):+.2f}§r\n"
+                        f"应计利息: -${float(interest):.2f}\n"
+                        f"占用保证金: ${float(margin):.2f}\n"
+                        f"权益(返还估算): ${float(equity):.2f}\n"
+                        f"剩余保证金率: {rate_color}{rate:.1f}%§r (强平线 {maintenance_rate:.0f}%)\n"
+                        f"预估强平价: §c${float(liq_price):.2f}§r\n\n"
+                        f"§7平仓另有手续费 {self.plugin.setting_manager.get_trading_fee_rate()}%"
+                    )
+
+                    def show_panel(p):
+                        panel = ActionForm(title=f"仓位 #{pos['id']}", content=content)
+                        panel.add_button(
+                            "全部平仓",
+                            on_click=lambda sender: self._confirm_contract_close(sender, pos["id"], None)
+                        )
+                        panel.add_button(
+                            "部分平仓",
+                            on_click=lambda sender: self._show_partial_close_panel(sender, pos["id"], pos["share"])
+                        )
+                        panel.add_button(
+                            "追加保证金",
+                            on_click=lambda sender: self._show_add_margin_panel(sender, pos["id"])
+                        )
+                        panel.add_button(
+                            "刷新",
+                            on_click=lambda sender: self.show_contract_position_detail(sender, pos["id"])
+                        )
+                        panel.add_button(
+                            "返回仓位列表",
+                            on_click=lambda sender: self.show_contract_positions_panel(sender)
+                        )
+                        p.send_form(panel)
+
+                    self._run_for_player(player, show_panel)
+
+                except Exception as e:
+                    print(f"加载仓位详情错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c加载仓位详情时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示仓位详情错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示仓位详情时发生错误")
+
+    def _show_partial_close_panel(self, player, position_id: int, max_share: int):
+        """部分平仓输入面板"""
+        partial_form = ModalForm(
+            title=f"部分平仓 #{position_id}",
+            controls=[
+                Label(text=f"当前持仓 {max_share} 股\n输入要平掉的股数（1-{max_share}）"),
+                TextInput(
+                    label="平仓股数",
+                    placeholder=f"1-{max_share} ...",
+                    default_value="1"
+                )
+            ],
+            on_submit=lambda sender, json_str: self._handle_partial_close_input(sender, position_id, max_share, json_str),
+            on_close=lambda sender: self.show_contract_position_detail(sender, position_id)
+        )
+        player.send_form(partial_form)
+
+    def _handle_partial_close_input(self, player, position_id: int, max_share: int, json_str: str):
+        try:
+            data = json.loads(json_str)
+            share = int(str(data[1] or "").strip())
+            if share < 1 or share > max_share:
+                player.send_message(f"§c请输入 1-{max_share} 之间的股数")
+                self._show_partial_close_panel(player, position_id, max_share)
+                return
+            self._confirm_contract_close(player, position_id, share)
+        except Exception:
+            player.send_message("§c请输入有效的股数")
+            self._show_partial_close_panel(player, position_id, max_share)
+
+    def _show_add_margin_panel(self, player, position_id: int):
+        """追加保证金输入面板"""
+        try:
+            xuid = player.xuid
+            pos = self.plugin.stock_dao.get_margin_position(position_id)
+            if pos is None or str(pos["player_xuid"]) != str(xuid) or pos["status"] != "open":
+                player.send_message("§c该仓位不存在或已平仓")
+                self.show_contract_positions_panel(player)
+                return
+
+            balance = self.plugin.stock_dao.get_balance(xuid)
+            add_form = ModalForm(
+                title=f"追加保证金 #{position_id}",
+                controls=[
+                    Label(
+                        text=f"仓位: {pos['stock_name']} "
+                             f"{'▲多' if pos['direction'] == 'long' else '▼空'} {pos['leverage']}x\n"
+                             f"当前保证金: ${float(pos['margin']):.2f}\n"
+                             f"账户余额: ${balance:.2f}\n\n"
+                             f"§e追加后强平价远离现价，借入减少、利息变慢；\n"
+                             f"§c爆仓时追加部分同样会亏掉。"),
+                    TextInput(
+                        label="追加金额",
+                        placeholder="输入要从余额划入的金额...",
+                        default_value=""
+                    )
+                ],
+                on_submit=lambda sender, json_str: self._handle_add_margin_input(sender, position_id, json_str),
+                on_close=lambda sender: self.show_contract_position_detail(sender, position_id)
+            )
+            player.send_form(add_form)
+
+        except Exception as e:
+            print(f"显示追加保证金面板错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示追加保证金面板时发生错误")
+
+    def _handle_add_margin_input(self, player, position_id: int, json_str: str):
+        """校验金额并展示追加后风险指标预览"""
+        try:
+            data = json.loads(json_str)
+            amount_str = str(data[1] or "").strip()
+            try:
+                amount = Decimal(amount_str)
+                if amount <= 0:
+                    raise ValueError()
+            except Exception:
+                player.send_message("§c请输入有效的追加金额（大于0）")
+                self._show_add_margin_panel(player, position_id)
+                return
+
+            xuid = player.xuid
+            import threading
+
+            def load_preview():
+                try:
+                    pos = self.plugin.stock_dao.get_margin_position(position_id)
+                    if pos is None or pos["status"] != "open":
+                        self._run_for_player(player, lambda p: p.send_message("§c该仓位已平仓或不存在"))
+                        return
+
+                    balance = self.plugin.stock_dao.get_balance(xuid)
+                    if balance is None or Decimal(str(balance)) < amount:
+                        self._run_for_player(player, lambda p: p.send_message(
+                            f"§c余额不足：需 {float(amount):.2f} 元，当前余额 {balance} 元"))
+                        return
+
+                    market_price, _ = self.plugin.get_stock_last_price(pos["stock_name"])
+                    interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+                    maintenance_rate = self.plugin.setting_manager.get_contract_maintenance_rate()
+                    warning_rate = self.plugin.setting_manager.get_contract_warning_rate()
+
+                    old_margin = Decimal(str(pos["margin"]))
+                    new_margin = old_margin + amount
+                    new_liq_text = old_liq_text = "获取失败"
+                    old_rate_text = new_rate_text = "获取失败"
+                    if market_price:
+                        pnl, interest = self.plugin._calc_contract_pnl_interest(pos, market_price, interest_hourly)
+                        old_equity = old_margin + pnl - interest
+                        new_equity = new_margin + pnl - interest
+                        if old_margin > 0:
+                            old_rate_text = f"{float(old_equity / old_margin * 100):.1f}%"
+                        if new_margin > 0:
+                            new_rate_text = f"{float(new_equity / new_margin * 100):.1f}%"
+                            new_rate_color = self._contract_rate_color(
+                                float(new_equity / new_margin * 100), warning_rate
+                            )
+                            new_rate_text = f"{new_rate_color}{new_rate_text}§r"
+                        old_liq_text = f"${float(self.plugin._calc_contract_liquidation_price(pos, maintenance_rate)):.2f}"
+                        liq_view = {
+                            "direction": pos["direction"],
+                            "entry_price": pos["entry_price"],
+                            "share": pos["share"],
+                            "margin": float(new_margin),
+                        }
+                        new_liq_text = f"${float(self.plugin._calc_contract_liquidation_price(liq_view, maintenance_rate)):.2f}"
+
+                    content = (
+                        f"=== 追加保证金确认 ===\n\n"
+                        f"仓位 #{pos['id']} {pos['stock_name']} "
+                        f"{'▲多' if pos['direction'] == 'long' else '▼空'} {pos['leverage']}x\n"
+                        f"追加金额: ${float(amount):.2f}\n"
+                        f"保证金: ${float(old_margin):.2f} → ${float(new_margin):.2f}\n\n"
+                        f"剩余保证金率: {old_rate_text} → {new_rate_text}\n"
+                        f"预估强平价: {old_liq_text} → §a{new_liq_text}§r\n\n"
+                        f"§7追加金额将从股票账户余额中扣除"
+                    )
+
+                    def show_confirm(p):
+                        confirm_form = ActionForm(title="追加保证金确认", content=content)
+                        confirm_form.add_button(
+                            "确认追加",
+                            on_click=lambda sender: self._handle_add_margin_confirm(
+                                sender, position_id, amount
+                            )
+                        )
+                        confirm_form.add_button(
+                            "返回仓位详情",
+                            on_click=lambda sender: self.show_contract_position_detail(sender, position_id)
+                        )
+                        p.send_form(confirm_form)
+
+                    self._run_for_player(player, show_confirm)
+
+                except Exception as e:
+                    print(f"追加保证金预览错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c生成追加预览时发生错误"))
+
+            threading.Thread(target=load_preview).start()
+
+        except Exception as e:
+            print(f"处理追加保证金输入错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c处理追加保证金输入时发生错误")
+
+    def _handle_add_margin_confirm(self, player, position_id: int, amount):
+        xuid = player.xuid
+        params = ["margin", str(position_id), str(amount)]
+        callback_args = {"position_id": position_id}
+        self.plugin.execute_command(player, params, True, self._handle_add_margin_callback, callback_args)
+
+    def _handle_add_margin_callback(self, rtn, player, args):
+        success, message = rtn
+        position_id = args["position_id"]
+        result_form = ActionForm(
+            title="追加成功" if success else "追加失败",
+            content=message,
+            on_close=lambda sender: self.show_contract_position_detail(sender, position_id)
+        )
+        result_form.add_button(
+            "返回仓位详情",
+            on_click=lambda sender: self.show_contract_position_detail(sender, position_id)
+        )
+        result_form.add_button(
+            "返回仓位列表",
+            on_click=lambda sender: self.show_contract_positions_panel(sender)
+        )
+        player.send_form(result_form)
+
+    def _confirm_contract_close(self, player, position_id: int, share):
+        """平仓确认面板（share=None 为全部平仓）"""
+        try:
+            import threading
+
+            def load_data():
+                try:
+                    pos = self.plugin.stock_dao.get_margin_position(position_id)
+                    if pos is None or pos["status"] != "open":
+                        self._run_for_player(player, lambda p: p.send_message("§c该仓位已平仓或不存在"))
+                        return
+
+                    market_price, _ = self.plugin.get_stock_last_price(pos["stock_name"])
+                    if not market_price:
+                        self._run_for_player(player, lambda p: p.send_message("§c无法获取当前价格，请稍后再试"))
+                        return
+
+                    price = Decimal(str(market_price))
+                    full_close = share is None or share >= pos["share"]
+                    close_share = pos["share"] if full_close else share
+                    interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+                    pnl, interest = self.plugin._calc_contract_pnl_interest(pos, price, interest_hourly)
+
+                    proportion = Decimal(close_share) / Decimal(pos["share"])
+                    fee_rate = Decimal(str(self.plugin.setting_manager.get_trading_fee_rate() / 100))
+                    close_fee = price * Decimal(close_share) * fee_rate
+                    returned = (Decimal(str(pos["margin"])) + pnl) * proportion - close_fee - interest * proportion
+
+                    action_text = "全部平仓" if full_close else f"平仓 {close_share}/{pos['share']} 股"
+                    content = (
+                        f"=== 平仓确认 ===\n\n"
+                        f"仓位 #{pos['id']} {pos['stock_name']} "
+                        f"{'▲多' if pos['direction'] == 'long' else '▼空'} {pos['leverage']}x\n"
+                        f"操作: {action_text}\n"
+                        f"现价: ${float(price):.2f}\n\n"
+                        f"预计结算款: ${float(returned):.2f}\n"
+                        f"(含平仓费 -${float(close_fee):.2f}，利息 -${float(interest * proportion):.2f})\n\n"
+                        f"§7市价平仓以确认时的实时价格成交"
+                    )
+
+                    def show_confirm(p):
+                        confirm_form = ActionForm(title="平仓确认", content=content)
+                        confirm_form.add_button(
+                            f"确认{action_text}",
+                            on_click=lambda sender: self._handle_contract_close(
+                                sender, position_id, None if full_close else close_share
+                            )
+                        )
+                        confirm_form.add_button(
+                            "返回仓位详情",
+                            on_click=lambda sender: self.show_contract_position_detail(sender, position_id)
+                        )
+                        p.send_form(confirm_form)
+
+                    self._run_for_player(player, show_confirm)
+
+                except Exception as e:
+                    print(f"平仓确认错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c生成平仓确认时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示平仓确认错误: {str(e)}")
+            player.send_message("§c显示平仓确认时发生错误")
+
+    def _handle_contract_close(self, player, position_id: int, share):
+        xuid = player.xuid
+        params = ["close", str(position_id)]
+        if share is not None:
+            params.append(str(share))
+        callback_args = {"position_id": position_id}
+        self.plugin.execute_command(player, params, True, self._handle_contract_close_callback, callback_args)
+
+    def _handle_contract_close_callback(self, rtn, player, args):
+        success, message = rtn
+        position_id = args["position_id"]
+        result_form = ActionForm(
+            title="平仓成功" if success else "平仓失败",
+            content=message,
+            on_close=lambda sender: self.show_contract_positions_panel(sender)
+        )
+        result_form.add_button(
+            "返回仓位列表",
+            on_click=lambda sender: self.show_contract_positions_panel(sender)
+        )
+        player.send_form(result_form)
+
+    def show_contract_history_panel(self, player, page: int = 0):
+        """已平仓仓位历史"""
+        try:
+            xuid = player.xuid
+            import threading
+
+            def load_data():
+                try:
+                    rows = self.plugin.stock_dao.get_margin_positions(
+                        xuid, exclude_open=True, page=page, page_size=8
+                    )
+                    closed_rows = list(rows)
+
+                    if not closed_rows:
+                        def show_empty(p):
+                            empty_form = ActionForm(
+                                title="仓位历史",
+                                content="暂无已平仓记录",
+                                on_close=lambda sender: self.show_contract_center(sender)
+                            )
+                            empty_form.add_button(
+                                "返回合约中心",
+                                on_click=lambda sender: self.show_contract_center(sender)
+                            )
+                            p.send_form(empty_form)
+
+                        self._run_for_player(player, show_empty)
+                        return
+
+                    buttons_data = []
+                    for pos in closed_rows:
+                        direction_mark = "▲多" if pos["direction"] == "long" else "▼空"
+                        if pos["status"] == "liquidated":
+                            status_text = "§c爆仓"
+                        else:
+                            status_text = "平仓"
+                        pnl = float(pos["realized_pnl"] or 0)
+                        profit_color = self.plugin.player_settings_manager.get_color_for_change(xuid, pnl)
+                        button_text = (
+                            f"#{pos['id']} {pos['stock_name']} {direction_mark} {pos['leverage']}x [{status_text}§r]\n"
+                            f"{pos['share']}股 @ ${float(pos['entry_price']):.2f} → ${float(pos['close_price'] or 0):.2f}\n"
+                            f"净盈亏 {profit_color}{pnl:+.2f}§r"
+                        )
+                        buttons_data.append((button_text, pos["id"]))
+
+                    def show_panel(p):
+                        panel = ActionForm(title="仓位历史", content="点击查看该笔平仓结果")
+                        for button_text, position_id in buttons_data:
+                            panel.add_button(
+                                button_text,
+                                on_click=lambda sender, pid=position_id: self._show_closed_position_detail(sender, pid)
+                            )
+                        if len(rows) >= 8:
+                            panel.add_button(
+                                "下一页",
+                                on_click=lambda sender: self.show_contract_history_panel(sender, page + 1)
+                            )
+                        if page > 0:
+                            panel.add_button(
+                                "上一页",
+                                on_click=lambda sender: self.show_contract_history_panel(sender, page - 1)
+                            )
+                        panel.add_button(
+                            "返回合约中心",
+                            on_click=lambda sender: self.show_contract_center(sender)
+                        )
+                        p.send_form(panel)
+
+                    self._run_for_player(player, show_panel)
+
+                except Exception as e:
+                    print(f"加载仓位历史错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c加载仓位历史时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示仓位历史错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            player.send_message("§c显示仓位历史时发生错误")
+
+    def _show_closed_position_detail(self, player, position_id: int):
+        """已平仓仓位结算单"""
+        try:
+            import threading
+
+            def load_data():
+                try:
+                    pos = self.plugin.stock_dao.get_margin_position(position_id)
+                    if pos is None or pos["status"] == "open":
+                        self._run_for_player(player, lambda p: p.send_message("§c记录不存在"))
+                        return
+
+                    is_liquidated = pos["status"] == "liquidated"
+                    direction_text = "▲ 做多" if pos["direction"] == "long" else "▼ 做空"
+                    hold_hours = 0.0
+                    if pos["close_time"] and pos["open_time"]:
+                        hold_hours = max(float(pos["close_time"]) - float(pos["open_time"]), 0.0) / 3600.0
+
+                    pnl = float(pos["realized_pnl"] or 0)
+                    profit_color = self.plugin.player_settings_manager.get_color_for_change(
+                        pos["player_xuid"], pnl
+                    )
+
+                    fee_text = f"${float(pos['close_fee'] or 0):.2f}"
+                    if is_liquidated:
+                        fee_text += f" + 强平费 ${float(pos['liquidation_fee'] or 0):.2f}"
+
+                    liquidated_line = "§c※ 该仓位已被系统强制平仓（爆仓）§r\n" if is_liquidated else ""
+                    content = (
+                        f"=== 平仓结算单 #{pos['id']} ===\n\n"
+                        f"标的: {pos['stock_name']} {direction_text} {pos['leverage']}x\n"
+                        f"{liquidated_line}"
+                        f"股数: {pos['share']} 股   持仓: {hold_hours:.1f} 小时\n\n"
+                        f"开仓价: ${float(pos['entry_price']):.2f}\n"
+                        f"平仓价: ${float(pos['close_price'] or 0):.2f}\n"
+                        f"开仓费: ${float(pos['open_fee'] or 0):.2f}\n"
+                        f"平仓费/强平费: {fee_text}\n"
+                        f"利息: ${float(pos['interest'] or 0):.2f}\n\n"
+                        f"净盈亏: {profit_color}{pnl:+.2f}§r"
+                    )
+
+                    def show_panel(p):
+                        panel = ActionForm(title=f"结算单 #{pos['id']}", content=content)
+                        panel.add_button(
+                            "返回仓位历史",
+                            on_click=lambda sender: self.show_contract_history_panel(sender)
+                        )
+                        p.send_form(panel)
+
+                    self._run_for_player(player, show_panel)
+
+                except Exception as e:
+                    print(f"加载结算单错误: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    self._run_for_player(player, lambda p: p.send_message("§c加载结算单时发生错误"))
+
+            threading.Thread(target=load_data).start()
+
+        except Exception as e:
+            print(f"显示结算单错误: {str(e)}")
+            player.send_message("§c显示结算单时发生错误")
+
+    def show_contract_teaching_panel(self, player):
+        """合约教学页"""
+        try:
+            fee_rate = self.plugin.setting_manager.get_trading_fee_rate()
+            interest_hourly = self.plugin.setting_manager.get_contract_interest_hourly()
+            maintenance_rate = self.plugin.setting_manager.get_contract_maintenance_rate()
+            liquidation_fee = self.plugin.setting_manager.get_contract_liquidation_fee_rate()
+            leverage_options = self.plugin.setting_manager.get_contract_leverage_options()
+
+            content = f'''§h=== 合约交易（做空/杠杆）教学 ===
+
+§6什么是合约？
+§a合约让你不必全款买股票，而是投入一部分§e保证金§a，借入其余资金放大涨跌收益。看涨开§a多§a，看跌开§c空§a。
+
+§6核心概念：
+§a• 保证金：开仓锁定的本金，仓位价值 = 保证金 × 杠杆
+§a• 杠杆：本服可选 {leverage_options} 倍，越高波动越剧烈
+§a• 利息：按小时对借入部分收取 {interest_hourly}%%，持仓越久扣得越多
+§a• 强平：权益跌到保证金的 {maintenance_rate:.0f}%% 时系统强制平仓，另收 {liquidation_fee}%% 强平费
+
+§6举个例子：
+§a投入 $100 保证金，5x 杠杆开多价值 $500 的股票。
+§a股价涨 2%% → 赚 $10（本金的 10%%）
+§a股价跌 2%% → 亏 $10；跌约 18%% → 爆仓，保证金几乎归零
+
+§6费用说明：
+§a• 开仓/平仓各收 {fee_rate}%% 手续费（按仓位价值）
+§a• 做空方向风险更大：股价上涨没有上限
+
+§6安全须知：
+§a• 逐仓模式：爆仓最多亏掉该笔保证金，不连累余额
+§a• 临近强平可在仓位详情页追加保证金自救，强平价会拉远
+§a• 强平检测每数十秒一轮，存在延迟，不要贴着强平线持仓
+§a• 建议单笔保证金不超过余额的 20%%，预留资金应对波动'''
+
+            panel = ActionForm(
+                title="合约教学",
+                content=content
+            )
+
+            panel.add_button(
+                "返回教学指引",
+                on_click=lambda sender: self.show_help_panel(sender)
+            )
+
+            panel.add_button(
+                "返回合约中心",
+                on_click=lambda sender: self.show_contract_center(sender)
+            )
+
+            player.send_form(panel)
+
+        except Exception as e:
+            print(f"显示合约教学面板错误: {str(e)}")
+            player.send_message("§c显示合约教学时发生错误")
+
     # ==================== 历史订单面板 ====================
     def show_orders_panel(self, player, page: int = 0):
         """显示历史订单面板"""
@@ -1043,7 +2040,12 @@ class UIManager:
                 "buy_flex": "市价买入",
                 "buy_fix": "限价买入",
                 "sell_flex": "市价卖出",
-                "sell_fix": "限价卖出"
+                "sell_fix": "限价卖出",
+                "contract_open_long": "合约开多",
+                "contract_open_short": "合约开空",
+                "contract_close": "合约平仓",
+                "contract_liquidation": "合约强平",
+                "contract_add_margin": "合约追加保证金"
             }
             
             for order in orders:
@@ -1600,14 +2602,20 @@ class UIManager:
 §a• 市价单：按当前市场价格立即成交
 §a• 限价单：指定价格，只有价格合适时才成交
 §a• 时间范围：支持查看10分钟、10天、10个月的价格走势
+§a• 合约交易：支持做空与杠杆（逐仓），详见合约教学
 
 §s提示：建议使用专业股票软件查询最新价格'''
-            
+
             help_panel = ActionForm(
                 title="教学指引",
                 content=help_content
             )
-            
+
+            help_panel.add_button(
+                "合约交易教学(做空/杠杆)",
+                on_click=lambda sender: self.show_contract_teaching_panel(sender)
+            )
+
             help_panel.add_button(
                 "基础知识详解",
                 on_click=lambda sender: self.show_basic_knowledge_panel(sender)
