@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v0.6.0 合约升级冒烟测试：stub endstone/yfinance 后导入全部模块，并对 DAO/数学做单测。"""
+"""v1.0.0 合约升级冒烟测试：stub endstone/yfinance 后导入全部模块，并对 DAO/数学做单测。"""
 import os
 import sys
 import time
