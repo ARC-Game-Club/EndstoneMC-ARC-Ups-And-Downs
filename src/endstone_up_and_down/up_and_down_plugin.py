@@ -75,6 +75,8 @@ class UpAndDownPlugin(Plugin):
     def on_load(self) -> None:
         # 初始化配置管理器
         self.setting_manager = StockSettingManager(self.MAIN_PATH)
+        # 合约配置项连同默认值落盘，便于服主调整
+        self.setting_manager.ensure_contract_config()
         
         # 配置 yfinance 代理
         enable_proxy, proxy_address = self.setting_manager.get_proxy_config()

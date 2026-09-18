@@ -171,6 +171,27 @@ contract_warning_rate=30
         except ValueError:
             return 10
 
+    def ensure_contract_config(self):
+        """
+        首次加载时把合约配置项连同默认值写入配置文件，便于服主查看与调整。
+        已存在但值为空的键（历史懒加载残留）也会补上默认值。
+        """
+        defaults = {
+            "contract_max_leverage": "10",
+            "contract_leverage_options": "2,3,5,10",
+            "contract_maintenance_rate": "10",
+            "contract_interest_hourly": "0.01",
+            "contract_liquidation_fee": "1.0",
+            "contract_min_margin": "100",
+            "contract_check_interval": "20",
+            "contract_warning_rate": "30",
+        }
+        for key, value in defaults.items():
+            if not StockSettingManager.setting_dict.get(key):
+                StockSettingManager.setting_dict[key] = value
+                with self.setting_file_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n{key}={value}")
+
     def get_contract_leverage_options(self):
         """获取可选杠杆档位列表（去重、升序、过滤超上限）"""
         raw = self.get_setting("contract_leverage_options", "2,3,5,10") or "2,3,5,10"
